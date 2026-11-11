@@ -92,3 +92,4 @@ if __name__ == "__main__":
     except Exception:
         logger.exception("Agent startup failed")
         raise
+
