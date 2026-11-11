@@ -11,8 +11,6 @@ hassio_role: backup
 arch:
   - amd64
   - aarch64
-map:
-  - backup:rw
 options:
   client_code: ""
   api_key: ""
