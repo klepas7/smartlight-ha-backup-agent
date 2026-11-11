@@ -6,6 +6,8 @@ url: https://github.com/klepas7/smartlight-ha-backup-agent
 startup: application
 boot: auto
 init: false
+hassio_api: true
+hassio_role: backup
 arch:
   - amd64
   - aarch64
