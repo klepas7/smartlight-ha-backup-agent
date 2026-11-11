@@ -9,9 +9,6 @@ init: false
 arch:
   - amd64
   - aarch64
-  - armv7
-  - armhf
-  - i386
 map:
   - backup:rw
 options:
