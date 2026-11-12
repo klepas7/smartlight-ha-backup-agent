@@ -12,6 +12,7 @@ import aiohttp
 OPTIONS_PATH = Path("/data/options.json")
 TEST_DONE_PATH = Path("/data/supervisor_encrypted_test_done")
 TEST_PASSWORD_PATH = Path("/data/supervisor_test_password")
+SHARED_PASSWORD_PATH = Path("/share/smartlight_test_password.txt")
 
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
 HEARTBEAT_INTERVAL = 60
@@ -70,16 +71,47 @@ def get_test_password():
 
     password = secrets.token_urlsafe(32)
 
-    TEST_PASSWORD_PATH.write_text(
-        password,
-        encoding="utf-8"
-    )
-
+    TEST_PASSWORD_PATH.write_text(password, encoding="utf-8")
     os.chmod(TEST_PASSWORD_PATH, 0o600)
 
     logger.info("New test encryption password generated and stored")
-
     return password
+
+
+def export_test_password():
+    if not TEST_PASSWORD_PATH.exists():
+        logger.error("Test password file not found")
+        return False
+
+    password = TEST_PASSWORD_PATH.read_text(
+        encoding="utf-8"
+    ).strip()
+
+    if not password:
+        logger.error("Test password file is empty")
+        return False
+
+    try:
+        SHARED_PASSWORD_PATH.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        SHARED_PASSWORD_PATH.write_text(
+            password,
+            encoding="utf-8"
+        )
+
+        os.chmod(SHARED_PASSWORD_PATH, 0o600)
+
+        logger.info(
+            "Existing test password exported to shared HA folder"
+        )
+        return True
+
+    except Exception:
+        logger.exception("Could not export test password")
+        return False
 
 
 async def test_supervisor_api(session):
@@ -108,7 +140,6 @@ async def test_supervisor_api(session):
                 "Supervisor API OK. Existing backups: %s",
                 len(backups)
             )
-
             return True
 
     except Exception:
@@ -126,7 +157,6 @@ async def create_encrypted_test_backup(session):
     password = get_test_password()
 
     url = f"{SUPERVISOR_URL}/backups/new/full"
-
     today = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     payload = {
@@ -250,6 +280,8 @@ async def main():
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         logger.info("HTTP client initialized")
+
+        export_test_password()
 
         supervisor_ok = await test_supervisor_api(session)
 
