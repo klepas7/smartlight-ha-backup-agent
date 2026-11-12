@@ -3,13 +3,15 @@ import os
 import json
 import asyncio
 import logging
+import secrets
 from pathlib import Path
 from datetime import datetime
 
 import aiohttp
 
 OPTIONS_PATH = Path("/data/options.json")
-TEST_DONE_PATH = Path("/data/supervisor_backup_test_done")
+TEST_DONE_PATH = Path("/data/supervisor_encrypted_test_done")
+TEST_PASSWORD_PATH = Path("/data/supervisor_test_password")
 
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
 HEARTBEAT_INTERVAL = 60
@@ -54,6 +56,32 @@ def supervisor_headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def get_test_password():
+    if TEST_PASSWORD_PATH.exists():
+        password = TEST_PASSWORD_PATH.read_text(
+            encoding="utf-8"
+        ).strip()
+
+        if not password:
+            raise RuntimeError("Stored test password is empty")
+
+        logger.info("Existing test encryption password loaded")
+        return password
+
+    password = secrets.token_urlsafe(32)
+
+    TEST_PASSWORD_PATH.write_text(
+        password,
+        encoding="utf-8"
+    )
+
+    os.chmod(TEST_PASSWORD_PATH, 0o600)
+
+    logger.info("New test encryption password generated and stored")
+
+    return password
+
+
 async def test_supervisor_api(session):
     url = f"{SUPERVISOR_URL}/backups"
 
@@ -80,6 +108,7 @@ async def test_supervisor_api(session):
                 "Supervisor API OK. Existing backups: %s",
                 len(backups)
             )
+
             return True
 
     except Exception:
@@ -87,19 +116,22 @@ async def test_supervisor_api(session):
         return False
 
 
-async def create_test_backup(session):
+async def create_encrypted_test_backup(session):
     if TEST_DONE_PATH.exists():
-        logger.info("Test backup already created. Skipping.")
+        logger.info("Encrypted test backup already created. Skipping.")
         return
 
-    logger.info("Starting one-time full backup test...")
+    logger.info("Starting encrypted full backup test...")
+
+    password = get_test_password()
 
     url = f"{SUPERVISOR_URL}/backups/new/full"
 
     today = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     payload = {
-        "name": f"SmartLight API test - {today}",
+        "name": f"SmartLight encrypted test - {today}",
+        "password": password,
         "compressed": True,
         "background": False
     }
@@ -116,7 +148,7 @@ async def create_test_backup(session):
 
             if response.status not in (200, 201):
                 logger.error(
-                    "Backup creation failed: HTTP %s - %s",
+                    "Encrypted backup creation failed: HTTP %s - %s",
                     response.status,
                     body
                 )
@@ -133,7 +165,10 @@ async def create_test_backup(session):
                 )
                 return
 
-            logger.info("Test backup created successfully. Slug: %s", slug)
+            logger.info(
+                "Encrypted test backup created. Slug: %s",
+                slug
+            )
 
         info_url = f"{SUPERVISOR_URL}/backups/{slug}/info"
 
@@ -142,31 +177,38 @@ async def create_test_backup(session):
             headers=supervisor_headers()
         ) as response:
 
-            if response.status == 200:
-                info_result = await response.json(content_type=None)
-                info = info_result.get("data", info_result)
-
-                logger.info(
-                    "Backup verified: name=%s, size=%s MB, protected=%s",
-                    info.get("name"),
-                    info.get("size"),
-                    info.get("protected")
-                )
-            else:
-                logger.warning(
-                    "Backup created, but info verification failed: HTTP %s",
+            if response.status != 200:
+                logger.error(
+                    "Backup info verification failed: HTTP %s",
                     response.status
                 )
+                return
 
-        TEST_DONE_PATH.write_text(
-            slug,
-            encoding="utf-8"
-        )
+            info_result = await response.json(content_type=None)
+            info = info_result.get("data", info_result)
 
-        logger.info("One-time backup test completed.")
+            protected = info.get("protected", False)
+
+            logger.info(
+                "Encrypted backup verified: name=%s, size=%s MB, protected=%s",
+                info.get("name"),
+                info.get("size"),
+                protected
+            )
+
+            if protected is not True:
+                logger.error(
+                    "Encryption verification FAILED: protected is not true"
+                )
+                return
+
+        TEST_DONE_PATH.write_text(slug, encoding="utf-8")
+        os.chmod(TEST_DONE_PATH, 0o600)
+
+        logger.info("Encrypted backup test completed successfully.")
 
     except Exception:
-        logger.exception("Test backup creation error")
+        logger.exception("Encrypted backup test error")
 
 
 async def heartbeat(session):
@@ -212,7 +254,7 @@ async def main():
         supervisor_ok = await test_supervisor_api(session)
 
         if supervisor_ok:
-            await create_test_backup(session)
+            await create_encrypted_test_backup(session)
 
         await heartbeat(session)
 
