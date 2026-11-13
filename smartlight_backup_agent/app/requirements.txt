@@ -1,1 +1,3 @@
+
 aiohttp==3.13.2
+securetar==2026.4.1
