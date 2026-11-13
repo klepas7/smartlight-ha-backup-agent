@@ -4,19 +4,26 @@ import json
 import asyncio
 import logging
 import secrets
+import hashlib
+import tarfile
+import shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiohttp
 
 OPTIONS_PATH = Path("/data/options.json")
 TEST_DONE_PATH = Path("/data/supervisor_encrypted_test_done")
 TEST_PASSWORD_PATH = Path("/data/supervisor_test_password")
-SHARED_PASSWORD_PATH = Path("/share/smartlight_test_password.txt")
+DOWNLOAD_DONE_PATH = Path("/data/supervisor_download_test_done")
+
+DOWNLOAD_PATH = Path("/share/smartlight_supervisor_api_test.tar")
+INNER_TEST_PATH = Path("/share/smartlight_inner_archive_test.tmp")
 
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
 HEARTBEAT_INTERVAL = 60
 SUPERVISOR_URL = "http://supervisor"
+
 
 def load_options():
     if not OPTIONS_PATH.exists():
@@ -31,9 +38,9 @@ def load_options():
     log_level = options.get("log_level", "info").upper()
 
     if not client_code:
-        raise RuntimeError("Client code is not configured")
+        raise RuntimeError("Client code is missing")
     if not api_key:
-        raise RuntimeError("API key is not configured")
+        raise RuntimeError("API key is missing")
 
     return client_code, api_key, server_url, log_level
 
@@ -41,8 +48,8 @@ def load_options():
 CLIENT_CODE, API_KEY, SERVER_URL, LOG_LEVEL = load_options()
 
 logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 
 logger = logging.getLogger("smartlight_backup_agent")
@@ -50,7 +57,6 @@ logger = logging.getLogger("smartlight_backup_agent")
 
 def supervisor_headers():
     token = os.getenv("SUPERVISOR_TOKEN")
-
     if not token:
         raise RuntimeError("SUPERVISOR_TOKEN is missing")
 
@@ -66,236 +72,414 @@ def get_test_password():
         if not password:
             raise RuntimeError("Stored test password is empty")
 
-        logger.info("Existing test encryption password loaded")
         return password
 
     password = secrets.token_urlsafe(32)
 
-    TEST_PASSWORD_PATH.write_text(password, encoding="utf-8")
-    os.chmod(TEST_PASSWORD_PATH, 0o600)
+    TEST_PASSWORD_PATH.write_text(
+        password,
+        encoding="utf-8",
+    )
+    TEST_PASSWORD_PATH.chmod(0o600)
 
-    logger.info("New test encryption password generated and stored")
     return password
 
 
-def export_test_password():
-    if not TEST_PASSWORD_PATH.exists():
-        logger.error("Test password file not found")
-        return False
+async def supervisor_request(session, method, path, **kwargs):
+    url = f"{SUPERVISOR_URL}{path}"
 
-    password = TEST_PASSWORD_PATH.read_text(
-        encoding="utf-8"
-    ).strip()
+    async with session.request(
+        method,
+        url,
+        headers=supervisor_headers(),
+        **kwargs,
+    ) as response:
 
-    if not password:
-        logger.error("Test password file is empty")
-        return False
+        if response.status >= 400:
+            body = await response.text()
+            raise RuntimeError(
+                f"Supervisor API error {response.status}: {body[:500]}"
+            )
 
-    try:
-        SHARED_PASSWORD_PATH.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+        if response.content_type == "application/json":
+            return await response.json()
 
-        SHARED_PASSWORD_PATH.write_text(
-            password,
-            encoding="utf-8"
-        )
-
-        os.chmod(SHARED_PASSWORD_PATH, 0o600)
-
-        logger.info(
-            "Existing test password exported to shared HA folder"
-        )
-        return True
-
-    except Exception:
-        logger.exception("Could not export test password")
-        return False
+        return response
 
 
 async def test_supervisor_api(session):
-    url = f"{SUPERVISOR_URL}/backups"
+    logger.info("Checking Supervisor backup API")
 
-    try:
-        async with session.get(
-            url,
-            headers=supervisor_headers()
-        ) as response:
+    result = await supervisor_request(
+        session,
+        "GET",
+        "/backups",
+    )
 
-            if response.status != 200:
-                body = await response.text()
-                logger.error(
-                    "Supervisor API failed: HTTP %s - %s",
-                    response.status,
-                    body
-                )
-                return False
+    data = result.get("data", result)
+    backups = data.get("backups", [])
 
-            payload = await response.json(content_type=None)
-            data = payload.get("data", payload)
-            backups = data.get("backups", [])
-
-            logger.info(
-                "Supervisor API OK. Existing backups: %s",
-                len(backups)
-            )
-            return True
-
-    except Exception:
-        logger.exception("Supervisor API connection error")
-        return False
+    logger.info(
+        "Supervisor API OK. Existing backups: %s",
+        len(backups),
+    )
 
 
 async def create_encrypted_test_backup(session):
     if TEST_DONE_PATH.exists():
-        logger.info("Encrypted test backup already created. Skipping.")
-        return
+        slug = TEST_DONE_PATH.read_text(
+            encoding="utf-8"
+        ).strip()
 
-    logger.info("Starting encrypted full backup test...")
+        if slug:
+            logger.info(
+                "Existing diagnostic backup found: %s",
+                slug,
+            )
+            return slug
+
+        TEST_DONE_PATH.unlink()
 
     password = get_test_password()
 
-    url = f"{SUPERVISOR_URL}/backups/new/full"
-    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    logger.info("Creating encrypted diagnostic backup")
+
+    result = await supervisor_request(
+        session,
+        "POST",
+        "/backups/new/full",
+        json={
+            "name": "SmartLight encryption diagnostic",
+            "password": password,
+            "compressed": True,
+            "background": False,
+        },
+        timeout=aiohttp.ClientTimeout(total=None),
+    )
+
+    data = result.get("data", result)
+    slug = data.get("slug")
+
+    if not slug:
+        raise RuntimeError(
+            f"Supervisor did not return backup slug: {result}"
+        )
+
+    logger.info("Diagnostic backup created: %s", slug)
+
+    info_result = await supervisor_request(
+        session,
+        "GET",
+        f"/backups/{slug}/info",
+    )
+
+    info = info_result.get("data", info_result)
+    protected = info.get("protected")
+
+    logger.info(
+        "Supervisor backup protected flag: %s",
+        protected,
+    )
+
+    if protected is not True:
+        raise RuntimeError(
+            "Diagnostic backup is not marked as protected"
+        )
+
+    TEST_DONE_PATH.write_text(
+        slug,
+        encoding="utf-8",
+    )
+    TEST_DONE_PATH.chmod(0o600)
+
+    return slug
+
+
+async def download_backup_from_supervisor(session, slug):
+    if DOWNLOAD_DONE_PATH.exists() and DOWNLOAD_PATH.exists():
+        logger.info(
+            "Diagnostic download already exists; reusing it"
+        )
+        return
+
+    logger.info(
+        "Downloading backup directly from Supervisor API"
+    )
+
+    url = f"{SUPERVISOR_URL}/backups/{slug}/download"
+
+    digest = hashlib.sha256()
+    total_size = 0
+
+    timeout = aiohttp.ClientTimeout(total=None)
+
+    async with session.get(
+        url,
+        headers=supervisor_headers(),
+        timeout=timeout,
+    ) as response:
+
+        if response.status != 200:
+            body = await response.text()
+            raise RuntimeError(
+                f"Backup download failed: HTTP {response.status}: "
+                f"{body[:500]}"
+            )
+
+        with DOWNLOAD_PATH.open("wb") as output:
+            async for chunk in response.content.iter_chunked(
+                1024 * 1024
+            ):
+                output.write(chunk)
+                digest.update(chunk)
+                total_size += len(chunk)
+
+    DOWNLOAD_PATH.chmod(0o600)
+
+    sha256 = digest.hexdigest()
+
+    logger.info(
+        "Supervisor download completed. Size: %s bytes",
+        total_size,
+    )
+    logger.info("Downloaded backup SHA256: %s", sha256)
+
+    DOWNLOAD_DONE_PATH.write_text(
+        json.dumps(
+            {
+                "slug": slug,
+                "size": total_size,
+                "sha256": sha256,
+                "date": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    DOWNLOAD_DONE_PATH.chmod(0o600)
+
+
+def inspect_backup_archive():
+    logger.info("Inspecting downloaded backup archive")
+
+    if not DOWNLOAD_PATH.exists():
+        raise RuntimeError("Downloaded backup file not found")
+
+    with tarfile.open(DOWNLOAD_PATH, "r:") as outer:
+        members = outer.getmembers()
+
+        backup_json_member = next(
+            (
+                member
+                for member in members
+                if member.name.endswith("backup.json")
+            ),
+            None,
+        )
+
+        if backup_json_member is None:
+            raise RuntimeError(
+                "backup.json not found in downloaded archive"
+            )
+
+        backup_json_file = outer.extractfile(
+            backup_json_member
+        )
+
+        if backup_json_file is None:
+            raise RuntimeError(
+                "Cannot read backup.json"
+            )
+
+        metadata = json.loads(
+            backup_json_file.read().decode("utf-8")
+        )
+
+        protected = metadata.get("protected")
+
+        logger.info(
+            "Downloaded archive metadata protected: %s",
+            protected,
+        )
+
+        inner_archives = [
+            member
+            for member in members
+            if member.isfile()
+            and (
+                member.name.endswith(".tar")
+                or member.name.endswith(".tar.gz")
+            )
+            and not member.name.endswith("backup.tar")
+        ]
+
+        logger.info(
+            "Inner archives found: %s",
+            len(inner_archives),
+        )
+
+        if not inner_archives:
+            raise RuntimeError(
+                "No inner component archives found"
+            )
+
+        selected = inner_archives[0]
+
+        logger.info(
+            "Inspecting inner archive: %s",
+            selected.name,
+        )
+
+        source = outer.extractfile(selected)
+
+        if source is None:
+            raise RuntimeError(
+                "Cannot read inner archive"
+            )
+
+        with INNER_TEST_PATH.open("wb") as target:
+            shutil.copyfileobj(source, target)
+
+    INNER_TEST_PATH.chmod(0o600)
+
+    with INNER_TEST_PATH.open("rb") as file:
+        magic = file.read(32)
+
+    logger.info(
+        "Inner archive first bytes (hex): %s",
+        magic.hex(),
+    )
+
+    plain_tar_readable = False
+    plain_tar_error = None
+
+    try:
+        with tarfile.open(
+            INNER_TEST_PATH,
+            "r:*",
+        ) as inner:
+            inner.getmembers()
+            plain_tar_readable = True
+
+    except Exception as error:
+        plain_tar_error = type(error).__name__
+
+    logger.info(
+        "Inner archive readable as ordinary TAR: %s",
+        plain_tar_readable,
+    )
+
+    if plain_tar_error:
+        logger.info(
+            "Ordinary TAR read error: %s",
+            plain_tar_error,
+        )
+
+    if protected is not True:
+        raise RuntimeError(
+            "Downloaded archive metadata does not indicate encryption"
+        )
+
+    if plain_tar_readable:
+        logger.warning(
+            "Inner archive is readable as ordinary TAR. "
+            "Encryption requires further investigation."
+        )
+    else:
+        logger.info(
+            "Inner archive is not readable as ordinary TAR. "
+            "This is consistent with encrypted backup content, "
+            "but is not by itself cryptographic proof."
+        )
+
+    INNER_TEST_PATH.unlink(missing_ok=True)
+
+    logger.info("Diagnostic archive inspection completed")
+
+
+async def run_encryption_diagnostic(session):
+    slug = await create_encrypted_test_backup(session)
+
+    await download_backup_from_supervisor(
+        session,
+        slug,
+    )
+
+    inspect_backup_archive()
+
+
+async def heartbeat(session):
+    url = f"{SERVER_URL}/api/agent/heartbeat"
+
+    headers = {
+        "X-Client-Key": API_KEY,
+        "Content-Type": "application/json",
+    }
 
     payload = {
-        "name": f"SmartLight encrypted test - {today}",
-        "password": password,
-        "compressed": True,
-        "background": False
+        "client_code": CLIENT_CODE,
+        "agent_version": "0.1.5-diagnostic",
+        "ha_version": os.getenv(
+            "HASSIO_VERSION",
+            "unknown",
+        ),
     }
 
     try:
         async with session.post(
             url,
-            headers=supervisor_headers(),
             json=payload,
-            timeout=None
+            headers=headers,
         ) as response:
 
-            body = await response.text()
-
-            if response.status not in (200, 201):
-                logger.error(
-                    "Encrypted backup creation failed: HTTP %s - %s",
+            if response.status == 200:
+                logger.info("Heartbeat OK")
+            else:
+                logger.warning(
+                    "Heartbeat failed: HTTP %s",
                     response.status,
-                    body
                 )
-                return
 
-            result = json.loads(body)
-            data = result.get("data", result)
-            slug = data.get("slug")
-
-            if not slug:
-                logger.error(
-                    "Backup response did not contain a slug: %s",
-                    body
-                )
-                return
-
-            logger.info(
-                "Encrypted test backup created. Slug: %s",
-                slug
-            )
-
-        info_url = f"{SUPERVISOR_URL}/backups/{slug}/info"
-
-        async with session.get(
-            info_url,
-            headers=supervisor_headers()
-        ) as response:
-
-            if response.status != 200:
-                logger.error(
-                    "Backup info verification failed: HTTP %s",
-                    response.status
-                )
-                return
-
-            info_result = await response.json(content_type=None)
-            info = info_result.get("data", info_result)
-
-            protected = info.get("protected", False)
-
-            logger.info(
-                "Encrypted backup verified: name=%s, size=%s MB, protected=%s",
-                info.get("name"),
-                info.get("size"),
-                protected
-            )
-
-            if protected is not True:
-                logger.error(
-                    "Encryption verification FAILED: protected is not true"
-                )
-                return
-
-        TEST_DONE_PATH.write_text(slug, encoding="utf-8")
-        os.chmod(TEST_DONE_PATH, 0o600)
-
-        logger.info("Encrypted backup test completed successfully.")
-
-    except Exception:
-        logger.exception("Encrypted backup test error")
-
-
-async def heartbeat(session):
-    url = f"{SERVER_URL}/api/agent/heartbeat"
-    headers = {"X-Client-Key": API_KEY}
-
-    while True:
-        try:
-            async with session.post(
-                url,
-                headers=headers
-            ) as response:
-
-                if response.status == 200:
-                    logger.info(
-                        "Heartbeat successful: %s",
-                        CLIENT_CODE
-                    )
-                else:
-                    body = await response.text()
-                    logger.error(
-                        "Heartbeat failed: HTTP %s - %s",
-                        response.status,
-                        body
-                    )
-
-        except Exception:
-            logger.exception("Heartbeat connection error")
-
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+    except Exception as error:
+        logger.warning(
+            "Heartbeat error: %s",
+            error,
+        )
 
 
 async def main():
-    logger.info("Initializing SmartLight Backup Agent")
-    logger.info("Client: %s", CLIENT_CODE)
-    logger.info("Server: %s", SERVER_URL)
+    logger.info("====================================")
+    logger.info(" SmartLight Backup Agent")
+    logger.info(" Starting diagnostic version")
+    logger.info("====================================")
 
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(
+        total=60,
+        connect=30,
+    )
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        logger.info("HTTP client initialized")
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
 
-        export_test_password()
+        try:
+            await test_supervisor_api(session)
 
-        supervisor_ok = await test_supervisor_api(session)
+            await run_encryption_diagnostic(
+                session
+            )
 
-        if supervisor_ok:
-            await create_encrypted_test_backup(session)
+        except Exception:
+            logger.exception(
+                "Encryption diagnostic failed"
+            )
 
-        await heartbeat(session)
+        while True:
+            await heartbeat(session)
+            await asyncio.sleep(
+                HEARTBEAT_INTERVAL
+            )
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Agent stopped")
-    except Exception:
-        logger.exception("Fatal agent error")
-        raise
+    asyncio.run(main())
