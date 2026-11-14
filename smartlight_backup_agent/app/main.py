@@ -496,7 +496,7 @@ def validate_encrypted_backup(path):
     )
 
     return validated
-    async def nas_request(
+async def nas_request(
     session, method, path, config, **kwargs
 ):
     headers = kwargs.pop("headers", {})
@@ -870,7 +870,7 @@ async def upload_backup_chunks(
     logger.info("====================================")
 
     return True
-    async def run_backup_test(session, config):
+async def run_backup_test(session, config):
     state = load_state()
 
     if (
