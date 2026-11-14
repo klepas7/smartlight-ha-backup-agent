@@ -1,4 +1,3 @@
-
 import asyncio
 import hashlib
 import json
@@ -6,6 +5,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import aiohttp
@@ -15,10 +15,11 @@ from securetar import SecureTarArchive
 OPTIONS_PATH = Path("/data/options.json")
 TEST_PASSWORD_PATH = Path("/data/supervisor_test_password")
 TEST_STATE_PATH = Path("/data/backup_test_state.json")
+SCHEDULE_STATE_PATH = Path("/data/backup_schedule_state.json")
 
 SUPERVISOR_URL = "http://supervisor"
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
-AGENT_VERSION = "0.1.12"
+AGENT_VERSION = "0.1.13"
 
 HEARTBEAT_INTERVAL = 60
 POLICY_SYNC_INTERVAL = 300
@@ -78,21 +79,27 @@ def load_options():
             options.get("backup_test_now", False)
         ),
         "backup_test_interrupt_after_chunks": interrupt_after,
+        "backup_once_datetime": options.get(
+            "backup_once_datetime", ""
+        ).strip(),
+        "backup_once_type": options.get(
+            "backup_once_type", "full"
+        ).strip().lower(),
         "policy": policy,
     }
 
 
-def load_state():
-    if not TEST_STATE_PATH.exists():
+def load_state(path=TEST_STATE_PATH):
+    if not path.exists():
         return {}
 
     try:
         state = json.loads(
-            TEST_STATE_PATH.read_text(encoding="utf-8")
+            path.read_text(encoding="utf-8")
         )
     except Exception as error:
         raise RuntimeError(
-            "Backup test state file is unreadable; "
+            f"Backup state file {path} is unreadable; "
             f"refusing to restart workflow: {error}"
         ) from error
 
@@ -104,8 +111,8 @@ def load_state():
     return state
 
 
-def save_state(state):
-    temporary = TEST_STATE_PATH.with_suffix(".tmp")
+def save_state(state, path=TEST_STATE_PATH):
+    temporary = path.with_suffix(".tmp")
 
     temporary.write_text(
         json.dumps(state, indent=2, sort_keys=True),
@@ -113,8 +120,8 @@ def save_state(state):
     )
 
     temporary.chmod(0o600)
-    temporary.replace(TEST_STATE_PATH)
-    TEST_STATE_PATH.chmod(0o600)
+    temporary.replace(path)
+    path.chmod(0o600)
 
 
 def supervisor_headers():
@@ -194,7 +201,13 @@ async def supervisor_json_request(
             ) from error
 
 
-async def create_or_reuse_backup(session, config, state):
+async def create_or_reuse_backup(
+    session,
+    config,
+    state,
+    state_path=TEST_STATE_PATH,
+    backup_label="test",
+):
     existing_slug = state.get("slug")
 
     if existing_slug:
@@ -227,7 +240,7 @@ async def create_or_reuse_backup(session, config, state):
     )
 
     backup_name = (
-        f"SmartLight-{config['client_code']}-test-{timestamp}"
+        f"SmartLight-{config['client_code']}-{backup_label}-{timestamp}"
     )
 
     state.update({
@@ -236,7 +249,7 @@ async def create_or_reuse_backup(session, config, state):
         "backup_request_started_at": utc_now(),
     })
 
-    save_state(state)
+    save_state(state, state_path)
 
     logger.info("Starting one-time Supervisor full backup")
     logger.info("Backup name: %s", backup_name)
@@ -268,7 +281,7 @@ async def create_or_reuse_backup(session, config, state):
             "backup_request_failed_at": utc_now(),
         })
 
-        save_state(state)
+        save_state(state, state_path)
         raise
 
     data = result.get("data", result)
@@ -280,7 +293,7 @@ async def create_or_reuse_backup(session, config, state):
             "backup_request_response": result,
         })
 
-        save_state(state)
+        save_state(state, state_path)
 
         raise RuntimeError(
             f"Supervisor response did not contain backup slug: {result}"
@@ -292,7 +305,7 @@ async def create_or_reuse_backup(session, config, state):
         "backup_created_at": utc_now(),
     })
 
-    save_state(state)
+    save_state(state, state_path)
 
     logger.info("SUPERVISOR BACKUP CREATED")
     logger.info("Backup slug: %s", slug)
@@ -301,7 +314,12 @@ async def create_or_reuse_backup(session, config, state):
     return slug
 
 
-async def download_backup(session, slug, state):
+async def download_backup(
+    session,
+    slug,
+    state,
+    state_path=TEST_STATE_PATH,
+):
     download_path = Path(
         f"/data/supervisor_backup_{slug}.tar"
     )
@@ -387,7 +405,7 @@ async def download_backup(session, slug, state):
         "downloaded_at": utc_now(),
     })
 
-    save_state(state)
+    save_state(state, state_path)
 
     logger.info(
         "Backup download completed: %s bytes",
@@ -478,9 +496,7 @@ def validate_encrypted_backup(path):
     )
 
     return validated
-
-
-async def nas_request(
+    async def nas_request(
     session, method, path, config, **kwargs
 ):
     headers = kwargs.pop("headers", {})
@@ -519,6 +535,8 @@ async def initiate_or_resume_upload(
     file_size,
     file_sha256,
     slug,
+    state_path=TEST_STATE_PATH,
+    backup_type="manual",
 ):
     upload_id = state.get("upload_id")
 
@@ -536,7 +554,7 @@ async def initiate_or_resume_upload(
         "filename": f"{slug}.tar",
         "file_size": file_size,
         "sha256": file_sha256,
-        "backup_type": "manual",
+        "backup_type": backup_type,
     }
 
     result = await nas_request(
@@ -568,7 +586,7 @@ async def initiate_or_resume_upload(
         "upload_status": result.get("status"),
     })
 
-    save_state(state)
+    save_state(state, state_path)
 
     logger.info("NAS upload session: %s", upload_id)
     logger.info(
@@ -595,6 +613,7 @@ async def upload_backup_chunks(
     path,
     upload_id,
     interrupt_after,
+    state_path=TEST_STATE_PATH,
 ):
     status = await get_upload_status(
         session,
@@ -629,7 +648,7 @@ async def upload_backup_chunks(
             "completed_at": utc_now(),
         })
 
-        save_state(state)
+        save_state(state, state_path)
 
         logger.info(
             "NAS upload was already verified: %s",
@@ -690,7 +709,7 @@ async def upload_backup_chunks(
 
         state["pause_for_restart"] = False
         state["resumed_after_restart_at"] = utc_now()
-        save_state(state)
+        save_state(state, state_path)
 
     uploaded_this_run = 0
 
@@ -766,7 +785,7 @@ async def upload_backup_chunks(
             "last_chunk_uploaded_at": utc_now(),
         })
 
-        save_state(state)
+        save_state(state, state_path)
 
         # Tyčinis nutrūkimas atliekamas tik vieną kartą.
         if (
@@ -782,7 +801,7 @@ async def upload_backup_chunks(
                 "paused_at": utc_now(),
             })
 
-            save_state(state)
+            save_state(state, state_path)
 
             logger.warning(
                 "TEST INTERRUPTION: uploaded %s chunks. "
@@ -840,7 +859,7 @@ async def upload_backup_chunks(
         "pause_for_restart": False,
     })
 
-    save_state(state)
+    save_state(state, state_path)
 
     logger.info("====================================")
     logger.info("NAS UPLOAD VERIFIED")
@@ -851,9 +870,7 @@ async def upload_backup_chunks(
     logger.info("====================================")
 
     return True
-
-
-async def run_backup_test(session, config):
+    async def run_backup_test(session, config):
     state = load_state()
 
     if (
@@ -909,6 +926,144 @@ async def run_backup_test(session, config):
         path,
         upload_id,
         config["backup_test_interrupt_after_chunks"],
+    )
+
+
+async def run_scheduled_full_backup(session, config, scheduled_date):
+    state = load_state(SCHEDULE_STATE_PATH)
+
+    if state.get("scheduled_date") not in (None, scheduled_date):
+        if state.get("status") != "completed":
+            raise RuntimeError(
+                "A previous scheduled backup is not completed; "
+                "refusing to overwrite its recovery state."
+            )
+        state = {}
+
+    state["scheduled_date"] = scheduled_date
+    state["backup_type"] = "full"
+    save_state(state, SCHEDULE_STATE_PATH)
+
+    if (
+        state.get("status") == "completed"
+        and state.get("upload_status") == "verified"
+    ):
+        logger.info(
+            "Scheduled Full backup for %s already completed",
+            scheduled_date,
+        )
+        return True
+
+    slug = await create_or_reuse_backup(
+        session,
+        config,
+        state,
+        state_path=SCHEDULE_STATE_PATH,
+        backup_label="full",
+    )
+
+    path, file_size, file_sha256 = await download_backup(
+        session,
+        slug,
+        state,
+        state_path=SCHEDULE_STATE_PATH,
+    )
+
+    if not state.get("validated"):
+        validated_count = validate_encrypted_backup(path)
+
+        state.update({
+            "validated": True,
+            "validated_inner_archives": validated_count,
+            "validated_at": utc_now(),
+        })
+
+        save_state(state, SCHEDULE_STATE_PATH)
+
+    else:
+        logger.info(
+            "Scheduled encrypted backup validation already recorded"
+        )
+
+    upload_id = await initiate_or_resume_upload(
+        session,
+        config,
+        state,
+        file_size,
+        file_sha256,
+        slug,
+        state_path=SCHEDULE_STATE_PATH,
+        backup_type="monthly",
+    )
+
+    return await upload_backup_chunks(
+        session,
+        config,
+        state,
+        path,
+        upload_id,
+        0,
+        state_path=SCHEDULE_STATE_PATH,
+    )
+
+
+async def run_one_time_backup_if_due(session, config):
+    target_text = config.get("backup_once_datetime", "")
+
+    if not target_text:
+        return
+
+    try:
+        target = datetime.fromisoformat(target_text)
+    except ValueError as error:
+        raise RuntimeError(
+            "backup_once_datetime must use YYYY-MM-DDTHH:MM format"
+        ) from error
+
+    if target.tzinfo is not None:
+        raise RuntimeError(
+            "backup_once_datetime must be local time without UTC offset"
+        )
+
+    if config.get("backup_once_type") != "full":
+        raise RuntimeError(
+            "Only backup_once_type=full is currently supported"
+        )
+
+    timezone_name = config["policy"].get(
+        "timezone",
+        "Europe/Vilnius",
+    )
+
+    local_now = datetime.now(ZoneInfo(timezone_name))
+    local_target = target.replace(tzinfo=ZoneInfo(timezone_name))
+
+    if (
+        local_now.date() != local_target.date()
+        or local_now < local_target
+    ):
+        return
+
+    scheduled_date = target.date().isoformat()
+    state = load_state(SCHEDULE_STATE_PATH)
+
+    if (
+        state.get("scheduled_date") == scheduled_date
+        and state.get("status") == "completed"
+        and state.get("upload_status") == "verified"
+    ):
+        return
+
+    logger.info(
+        "One-time backup is due: type=FULL, scheduled=%s %s",
+        target_text,
+        timezone_name,
+    )
+
+    await run_scheduled_full_backup(
+        session,
+        config,
+        scheduled_date,
     )
 
 
@@ -1041,6 +1196,11 @@ async def main():
 
                     if config["backup_test_now"]:
                         await run_backup_test(session, config)
+
+                    await run_one_time_backup_if_due(
+                        session,
+                        config,
+                    )
 
                 except Exception:
                     logger.exception("Agent cycle failed")
