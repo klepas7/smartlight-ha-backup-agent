@@ -19,7 +19,7 @@ SCHEDULE_STATE_PATH = Path("/data/backup_schedule_state.json")
 
 SUPERVISOR_URL = "http://supervisor"
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
-AGENT_VERSION = "0.1.13"
+AGENT_VERSION = "0.1.14"
 
 HEARTBEAT_INTERVAL = 60
 POLICY_SYNC_INTERVAL = 300
@@ -207,6 +207,7 @@ async def create_or_reuse_backup(
     state,
     state_path=TEST_STATE_PATH,
     backup_label="test",
+    backup_mode="full",
 ):
     existing_slug = state.get("slug")
 
@@ -251,9 +252,41 @@ async def create_or_reuse_backup(
 
     save_state(state, state_path)
 
-    logger.info("Starting one-time Supervisor full backup")
+    if backup_mode not in ("full", "partial"):
+        raise RuntimeError(f"Unsupported Supervisor backup mode: {backup_mode}")
+
+    endpoint = (
+        "/backups/new/full"
+        if backup_mode == "full"
+        else "/backups/new/partial"
+    )
+
+    payload = {
+        "name": backup_name,
+        "password": password,
+        "compressed": True,
+        "background": False,
+    }
+
+    if backup_mode == "partial":
+        payload.update({
+            "homeassistant": True,
+            "homeassistant_exclude_database": True,
+            "addons": [],
+            "folders": [],
+        })
+
+    logger.info(
+        "Starting Supervisor %s backup",
+        backup_mode.upper(),
+    )
     logger.info("Backup name: %s", backup_name)
     logger.info("Encryption: enabled")
+    if backup_mode == "partial":
+        logger.info(
+            "Partial scope: Home Assistant config only; "
+            "database excluded; no add-ons or extra folders"
+        )
 
     long_timeout = aiohttp.ClientTimeout(
         total=None,
@@ -264,13 +297,8 @@ async def create_or_reuse_backup(
         result = await supervisor_json_request(
             session,
             "POST",
-            "/backups/new/full",
-            json={
-                "name": backup_name,
-                "password": password,
-                "compressed": True,
-                "background": False,
-            },
+            endpoint,
+            json=payload,
             timeout=long_timeout,
         )
 
@@ -929,7 +957,16 @@ async def run_backup_test(session, config):
     )
 
 
-async def run_scheduled_full_backup(session, config, scheduled_date):
+async def run_scheduled_backup(
+    session,
+    config,
+    scheduled_date,
+    backup_type,
+):
+    if backup_type not in ("weekly", "monthly"):
+        raise RuntimeError(f"Unsupported scheduled backup type: {backup_type}")
+
+    backup_mode = "full" if backup_type == "monthly" else "partial"
     state = load_state(SCHEDULE_STATE_PATH)
 
     if state.get("scheduled_date") not in (None, scheduled_date):
@@ -940,8 +977,16 @@ async def run_scheduled_full_backup(session, config, scheduled_date):
             )
         state = {}
 
+    if state.get("scheduled_date") == scheduled_date:
+        saved_type = state.get("backup_type")
+        if saved_type not in (None, backup_type):
+            raise RuntimeError(
+                "Scheduled backup type changed for an existing date; "
+                "refusing to reuse its recovery state."
+            )
+
     state["scheduled_date"] = scheduled_date
-    state["backup_type"] = "full"
+    state["backup_type"] = backup_type
     save_state(state, SCHEDULE_STATE_PATH)
 
     if (
@@ -949,7 +994,8 @@ async def run_scheduled_full_backup(session, config, scheduled_date):
         and state.get("upload_status") == "verified"
     ):
         logger.info(
-            "Scheduled Full backup for %s already completed",
+            "Scheduled %s backup for %s already completed",
+            backup_type.upper(),
             scheduled_date,
         )
         return True
@@ -959,7 +1005,8 @@ async def run_scheduled_full_backup(session, config, scheduled_date):
         config,
         state,
         state_path=SCHEDULE_STATE_PATH,
-        backup_label="full",
+        backup_label=backup_mode,
+        backup_mode=backup_mode,
     )
 
     path, file_size, file_sha256 = await download_backup(
@@ -979,7 +1026,6 @@ async def run_scheduled_full_backup(session, config, scheduled_date):
         })
 
         save_state(state, SCHEDULE_STATE_PATH)
-
     else:
         logger.info(
             "Scheduled encrypted backup validation already recorded"
@@ -993,7 +1039,7 @@ async def run_scheduled_full_backup(session, config, scheduled_date):
         file_sha256,
         slug,
         state_path=SCHEDULE_STATE_PATH,
-        backup_type="monthly",
+        backup_type=backup_type,
     )
 
     return await upload_backup_chunks(
@@ -1060,30 +1106,16 @@ async def run_one_time_backup_if_due(session, config):
         timezone_name,
     )
 
-    await run_scheduled_full_backup(
+    await run_scheduled_backup(
         session,
         config,
         scheduled_date,
+        "monthly",
     )
 
 
 async def sync_policy(session, config):
-    logger.info("Synchronizing backup policy with NAS")
-
-    local_policy = config["policy"]
-
-    update_result = await nas_request(
-        session,
-        "PUT",
-        "/api/agent/policy",
-        config,
-        json=local_policy,
-    )
-
-    if update_result.get("status") != "updated":
-        raise RuntimeError(
-            f"Unexpected policy update response: {update_result}"
-        )
+    logger.info("Fetching authoritative backup policy from NAS")
 
     remote_result = await nas_request(
         session,
@@ -1099,28 +1131,128 @@ async def sync_policy(session, config):
             f"NAS returned invalid policy: {remote_result}"
         )
 
-    for key, expected in local_policy.items():
-        actual = remote_policy.get(key)
+    required = (
+        "backup_enabled",
+        "backup_day",
+        "backup_time",
+        "timezone",
+        "retention_weekly",
+        "retention_monthly",
+    )
+    missing = [key for key in required if key not in remote_policy]
+    if missing:
+        raise RuntimeError(
+            f"NAS policy is missing required fields: {', '.join(missing)}"
+        )
 
-        if key == "backup_enabled":
-            actual = bool(actual)
+    if not isinstance(remote_policy["backup_enabled"], (bool, int)):
+        raise RuntimeError("NAS policy backup_enabled must be boolean")
 
-        if actual != expected:
-            raise RuntimeError(
-                f"Policy mismatch for {key}: "
-                f"HA={expected}, NAS={actual}"
-            )
+    day = str(remote_policy["backup_day"]).lower()
+    valid_days = {
+        "monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday",
+    }
+    if day not in valid_days:
+        raise RuntimeError(f"Invalid backup_day in NAS policy: {day}")
 
-    logger.info("Backup policy synchronized successfully")
+    try:
+        datetime.strptime(remote_policy["backup_time"], "%H:%M")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Invalid backup_time in NAS policy: {remote_policy.get('backup_time')}"
+        ) from error
+
+    try:
+        ZoneInfo(remote_policy["timezone"])
+    except Exception as error:
+        raise RuntimeError(
+            f"Invalid timezone in NAS policy: {remote_policy.get('timezone')}"
+        ) from error
+
+    for key, maximum in (("retention_weekly", 52), ("retention_monthly", 24)):
+        value = remote_policy[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+            raise RuntimeError(f"Invalid {key} in NAS policy: {value}")
+
+    remote_policy["backup_enabled"] = bool(remote_policy["backup_enabled"])
+    remote_policy["backup_day"] = day
+
+    logger.info("Backup policy fetched successfully from NAS")
+    logger.info(
+        "Policy: enabled=%s, day=%s, time=%s %s, weekly_retention=%s, monthly_retention=%s",
+        remote_policy["backup_enabled"],
+        remote_policy["backup_day"],
+        remote_policy["backup_time"],
+        remote_policy["timezone"],
+        remote_policy["retention_weekly"],
+        remote_policy["retention_monthly"],
+    )
+
+    return remote_policy
+
+
+async def run_recurring_backup_if_due(session, config, policy):
+    if not policy or not policy.get("backup_enabled"):
+        return
+
+    timezone_name = policy["timezone"]
+    local_now = datetime.now(ZoneInfo(timezone_name))
+
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    scheduled_weekday = weekdays[policy["backup_day"]]
+
+    if local_now.weekday() != scheduled_weekday:
+        return
+
+    scheduled_time = datetime.strptime(
+        policy["backup_time"], "%H:%M"
+    ).time()
+    scheduled_at = local_now.replace(
+        hour=scheduled_time.hour,
+        minute=scheduled_time.minute,
+        second=0,
+        microsecond=0,
+    )
+
+    if local_now < scheduled_at:
+        return
+
+    scheduled_date = local_now.date().isoformat()
+    backup_type = (
+        "monthly"
+        if local_now.day <= 7
+        else "weekly"
+    )
+
+    state = load_state(SCHEDULE_STATE_PATH)
+    if (
+        state.get("scheduled_date") == scheduled_date
+        and state.get("status") == "completed"
+        and state.get("upload_status") == "verified"
+    ):
+        return
 
     logger.info(
-        "Policy: enabled=%s, day=%s, time=%s, "
-        "weekly=%s, monthly=%s",
-        local_policy["backup_enabled"],
-        local_policy["backup_day"],
-        local_policy["backup_time"],
-        local_policy["retention_weekly"],
-        local_policy["retention_monthly"],
+        "Recurring backup is due: type=%s, scheduled=%s %s",
+        backup_type.upper(),
+        scheduled_at.isoformat(),
+        timezone_name,
+    )
+
+    await run_scheduled_backup(
+        session,
+        config,
+        scheduled_date,
+        backup_type,
     )
 
 
@@ -1178,6 +1310,7 @@ async def main():
         )
 
         last_policy_sync = 0
+        active_policy = None
 
         try:
             while True:
@@ -1191,8 +1324,16 @@ async def main():
                         or loop_time - last_policy_sync
                         >= POLICY_SYNC_INTERVAL
                     ):
-                        await sync_policy(session, config)
-                        last_policy_sync = loop_time
+                        try:
+                            active_policy = await sync_policy(session, config)
+                            config["policy"] = active_policy
+                            last_policy_sync = loop_time
+                        except Exception:
+                            logger.exception(
+                                "NAS policy sync failed; keeping last valid policy"
+                            )
+                            if active_policy is None:
+                                raise
 
                     if config["backup_test_now"]:
                         await run_backup_test(session, config)
@@ -1201,6 +1342,13 @@ async def main():
                         session,
                         config,
                     )
+
+                    if active_policy is not None:
+                        await run_recurring_backup_if_due(
+                            session,
+                            config,
+                            active_policy,
+                        )
 
                 except Exception:
                     logger.exception("Agent cycle failed")
