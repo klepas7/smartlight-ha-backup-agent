@@ -1,3 +1,4 @@
+
 import asyncio
 import hashlib
 import json
@@ -13,13 +14,13 @@ from securetar import SecureTarArchive
 
 
 OPTIONS_PATH = Path("/data/options.json")
-TEST_PASSWORD_PATH = Path("/data/supervisor_test_password")
-TEST_STATE_PATH = Path("/data/backup_test_state.json")
+BACKUP_PASSWORD_PATH = Path("/data/backup_password")
+LEGACY_PASSWORD_PATH = Path("/data/supervisor_test_password")
 SCHEDULE_STATE_PATH = Path("/data/backup_schedule_state.json")
 
 SUPERVISOR_URL = "http://supervisor"
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
-AGENT_VERSION = "0.1.14"
+AGENT_VERSION = "1.0.0"
 
 HEARTBEAT_INTERVAL = 60
 POLICY_SYNC_INTERVAL = 300
@@ -51,45 +52,17 @@ def load_options():
         if not isinstance(value, str) or not value.strip():
             raise RuntimeError(f"Missing Add-on option: {key}")
 
-    policy = {
-        "backup_enabled": options.get("backup_enabled", True),
-        "backup_day": options.get("backup_day", "sunday"),
-        "backup_time": options.get("backup_time", "03:00"),
-        "timezone": options.get("timezone", "Europe/Vilnius"),
-        "retention_weekly": options.get("retention_weekly", 2),
-        "retention_monthly": options.get("retention_monthly", 1),
-    }
-
-    interrupt_after = int(
-        options.get("backup_test_interrupt_after_chunks", 3)
-    )
-
-    if interrupt_after < 0:
-        raise RuntimeError(
-            "backup_test_interrupt_after_chunks cannot be negative"
-        )
-
     return {
         "client_code": options["client_code"].strip(),
         "api_key": options["api_key"].strip(),
         "server_url": options.get(
             "server_url", DEFAULT_SERVER_URL
         ).rstrip("/"),
-        "backup_test_now": bool(
-            options.get("backup_test_now", False)
-        ),
-        "backup_test_interrupt_after_chunks": interrupt_after,
-        "backup_once_datetime": options.get(
-            "backup_once_datetime", ""
-        ).strip(),
-        "backup_once_type": options.get(
-            "backup_once_type", "full"
-        ).strip().lower(),
-        "policy": policy,
+        "log_level": str(options.get("log_level", "info")).lower(),
     }
 
 
-def load_state(path=TEST_STATE_PATH):
+def load_state(path=SCHEDULE_STATE_PATH):
     if not path.exists():
         return {}
 
@@ -105,13 +78,13 @@ def load_state(path=TEST_STATE_PATH):
 
     if not isinstance(state, dict):
         raise RuntimeError(
-            "Backup test state must contain a JSON object"
+            "Backup schedule state must contain a JSON object"
         )
 
     return state
 
 
-def save_state(state, path=TEST_STATE_PATH):
+def save_state(state, path=SCHEDULE_STATE_PATH):
     temporary = path.with_suffix(".tmp")
 
     temporary.write_text(
@@ -136,13 +109,19 @@ def supervisor_headers():
 
 
 def get_backup_password():
-    if not TEST_PASSWORD_PATH.is_file():
+    if not BACKUP_PASSWORD_PATH.is_file() and LEGACY_PASSWORD_PATH.is_file():
+        logger.warning(
+            "Migrating existing backup password to the production file path"
+        )
+        os.replace(LEGACY_PASSWORD_PATH, BACKUP_PASSWORD_PATH)
+        BACKUP_PASSWORD_PATH.chmod(0o600)
+
+    if not BACKUP_PASSWORD_PATH.is_file():
         raise RuntimeError(
-            "Backup password file not found: "
-            "/data/supervisor_test_password"
+            "Backup password file not found: /data/backup_password"
         )
 
-    password = TEST_PASSWORD_PATH.read_text(
+    password = BACKUP_PASSWORD_PATH.read_text(
         encoding="utf-8"
     ).strip()
 
@@ -205,8 +184,8 @@ async def create_or_reuse_backup(
     session,
     config,
     state,
-    state_path=TEST_STATE_PATH,
-    backup_label="test",
+    state_path=SCHEDULE_STATE_PATH,
+    backup_label="scheduled",
     backup_mode="full",
 ):
     existing_slug = state.get("slug")
@@ -282,6 +261,7 @@ async def create_or_reuse_backup(
     )
     logger.info("Backup name: %s", backup_name)
     logger.info("Encryption: enabled")
+
     if backup_mode == "partial":
         logger.info(
             "Partial scope: Home Assistant config only; "
@@ -346,7 +326,7 @@ async def download_backup(
     session,
     slug,
     state,
-    state_path=TEST_STATE_PATH,
+    state_path=SCHEDULE_STATE_PATH,
 ):
     download_path = Path(
         f"/data/supervisor_backup_{slug}.tar"
@@ -524,6 +504,8 @@ def validate_encrypted_backup(path):
     )
 
     return validated
+
+
 async def nas_request(
     session, method, path, config, **kwargs
 ):
@@ -563,7 +545,7 @@ async def initiate_or_resume_upload(
     file_size,
     file_sha256,
     slug,
-    state_path=TEST_STATE_PATH,
+    state_path=SCHEDULE_STATE_PATH,
     backup_type="manual",
 ):
     upload_id = state.get("upload_id")
@@ -640,8 +622,7 @@ async def upload_backup_chunks(
     state,
     path,
     upload_id,
-    interrupt_after,
-    state_path=TEST_STATE_PATH,
+    state_path=SCHEDULE_STATE_PATH,
 ):
     status = await get_upload_status(
         session,
@@ -722,29 +703,12 @@ async def upload_backup_chunks(
         len(missing_chunks),
     )
 
-    if state.get("pause_for_restart"):
-        if state.get("paused_instance_id") == INSTANCE_ID:
-            logger.info(
-                "Upload intentionally paused. "
-                "Restart the Add-on to resume."
-            )
-            return False
-
-        logger.info(
-            "Add-on restart detected; "
-            "resuming interrupted NAS upload"
-        )
-
-        state["pause_for_restart"] = False
-        state["resumed_after_restart_at"] = utc_now()
-        save_state(state, state_path)
-
-    uploaded_this_run = 0
-
     timeout = aiohttp.ClientTimeout(
         total=None,
         connect=30,
     )
+
+    uploaded_this_run = 0
 
     for chunk_index in missing_chunks:
         offset = chunk_index * CHUNK_SIZE
@@ -815,31 +779,6 @@ async def upload_backup_chunks(
 
         save_state(state, state_path)
 
-        # Tyčinis nutrūkimas atliekamas tik vieną kartą.
-        if (
-            interrupt_after > 0
-            and uploaded_this_run >= interrupt_after
-            and not state.get("interruption_test_done", False)
-        ):
-            state.update({
-                "pause_for_restart": True,
-                "interruption_test_done": True,
-                "paused_instance_id": INSTANCE_ID,
-                "paused_after_chunks": uploaded_this_run,
-                "paused_at": utc_now(),
-            })
-
-            save_state(state, state_path)
-
-            logger.warning(
-                "TEST INTERRUPTION: uploaded %s chunks. "
-                "Restart the Add-on now; the next run "
-                "will resume from NAS missing_chunks.",
-                uploaded_this_run,
-            )
-
-            return False
-
     final_status = await get_upload_status(
         session,
         config,
@@ -884,7 +823,6 @@ async def upload_backup_chunks(
         "nas_size_bytes": result.get("size_bytes"),
         "nas_sha256": result.get("sha256"),
         "completed_at": utc_now(),
-        "pause_for_restart": False,
     })
 
     save_state(state, state_path)
@@ -898,63 +836,6 @@ async def upload_backup_chunks(
     logger.info("====================================")
 
     return True
-async def run_backup_test(session, config):
-    state = load_state()
-
-    if (
-        state.get("status") == "completed"
-        and state.get("upload_status") == "verified"
-    ):
-        logger.info(
-            "Backup test and NAS upload already completed"
-        )
-        return
-
-    slug = await create_or_reuse_backup(
-        session,
-        config,
-        state,
-    )
-
-    path, file_size, file_sha256 = await download_backup(
-        session,
-        slug,
-        state,
-    )
-
-    if not state.get("validated"):
-        validated_count = validate_encrypted_backup(path)
-
-        state.update({
-            "validated": True,
-            "validated_inner_archives": validated_count,
-            "validated_at": utc_now(),
-        })
-
-        save_state(state)
-
-    else:
-        logger.info(
-            "Encrypted backup validation already recorded"
-        )
-
-    upload_id = await initiate_or_resume_upload(
-        session,
-        config,
-        state,
-        file_size,
-        file_sha256,
-        slug,
-    )
-
-    await upload_backup_chunks(
-        session,
-        config,
-        state,
-        path,
-        upload_id,
-        config["backup_test_interrupt_after_chunks"],
-    )
 
 
 async def run_scheduled_backup(
@@ -1048,69 +929,7 @@ async def run_scheduled_backup(
         state,
         path,
         upload_id,
-        0,
         state_path=SCHEDULE_STATE_PATH,
-    )
-
-
-async def run_one_time_backup_if_due(session, config):
-    target_text = config.get("backup_once_datetime", "")
-
-    if not target_text:
-        return
-
-    try:
-        target = datetime.fromisoformat(target_text)
-    except ValueError as error:
-        raise RuntimeError(
-            "backup_once_datetime must use YYYY-MM-DDTHH:MM format"
-        ) from error
-
-    if target.tzinfo is not None:
-        raise RuntimeError(
-            "backup_once_datetime must be local time without UTC offset"
-        )
-
-    if config.get("backup_once_type") != "full":
-        raise RuntimeError(
-            "Only backup_once_type=full is currently supported"
-        )
-
-    timezone_name = config["policy"].get(
-        "timezone",
-        "Europe/Vilnius",
-    )
-
-    local_now = datetime.now(ZoneInfo(timezone_name))
-    local_target = target.replace(tzinfo=ZoneInfo(timezone_name))
-
-    if (
-        local_now.date() != local_target.date()
-        or local_now < local_target
-    ):
-        return
-
-    scheduled_date = target.date().isoformat()
-    state = load_state(SCHEDULE_STATE_PATH)
-
-    if (
-        state.get("scheduled_date") == scheduled_date
-        and state.get("status") == "completed"
-        and state.get("upload_status") == "verified"
-    ):
-        return
-
-    logger.info(
-        "One-time backup is due: type=FULL, scheduled=%s %s",
-        target_text,
-        timezone_name,
-    )
-
-    await run_scheduled_backup(
-        session,
-        config,
-        scheduled_date,
-        "monthly",
     )
 
 
@@ -1289,6 +1108,10 @@ async def heartbeat_loop(session, config):
 
 async def main():
     config = load_options()
+    log_level = getattr(logging, config["log_level"].upper(), None)
+    if not isinstance(log_level, int):
+        raise RuntimeError(f"Invalid log_level: {config['log_level']}")
+    logger.setLevel(log_level)
 
     logger.info("====================================")
     logger.info(" SmartLight Backup Agent")
@@ -1334,14 +1157,6 @@ async def main():
                             )
                             if active_policy is None:
                                 raise
-
-                    if config["backup_test_now"]:
-                        await run_backup_test(session, config)
-
-                    await run_one_time_backup_if_due(
-                        session,
-                        config,
-                    )
 
                     if active_policy is not None:
                         await run_recurring_backup_if_due(
