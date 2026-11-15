@@ -1,3 +1,4 @@
+
 name: SmartLight Backup Agent
 version: "0.1.14"
 slug: smartlight_backup_agent
@@ -34,7 +35,7 @@ options:
   backup_test_now: false
   backup_test_interrupt_after_chunks: 3
 
-  backup_once_datetime: "2026-11-15T02:00"
+  backup_once_datetime: ""
   backup_once_type: full
 
 schema:
