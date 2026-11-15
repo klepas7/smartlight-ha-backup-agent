@@ -1,5 +1,5 @@
 name: SmartLight Backup Agent
-version: "0.1.13"
+version: "0.1.14"
 slug: smartlight_backup_agent
 description: Automated encrypted Home Assistant backups to SmartLight NAS
 url: https://github.com/klepas7/smartlight-ha-backup-agent
