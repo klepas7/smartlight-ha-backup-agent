@@ -20,7 +20,7 @@ SCHEDULE_STATE_PATH = Path("/data/backup_schedule_state.json")
 
 SUPERVISOR_URL = "http://supervisor"
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.0.1"
 
 HEARTBEAT_INTERVAL = 60
 POLICY_SYNC_INTERVAL = 300
@@ -957,6 +957,7 @@ async def sync_policy(session, config):
         "timezone",
         "retention_weekly",
         "retention_monthly",
+        "initial_full_required",
     )
     missing = [key for key in required if key not in remote_policy]
     if missing:
@@ -994,6 +995,11 @@ async def sync_policy(session, config):
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
             raise RuntimeError(f"Invalid {key} in NAS policy: {value}")
 
+    if type(remote_policy["initial_full_required"]) is not bool:
+        raise RuntimeError(
+            "NAS policy initial_full_required must be boolean"
+        )
+
     remote_policy["backup_enabled"] = bool(remote_policy["backup_enabled"])
     remote_policy["backup_day"] = day
 
@@ -1013,6 +1019,33 @@ async def sync_policy(session, config):
 
 async def run_recurring_backup_if_due(session, config, policy):
     if not policy or not policy.get("backup_enabled"):
+        return
+
+    # Finish a previously scheduled backup before evaluating a new
+    # schedule. Upload recovery must not wait for the next Sunday.
+    pending = load_state(SCHEDULE_STATE_PATH)
+    if pending.get("scheduled_date") and not (
+        pending.get("status") == "completed"
+        and pending.get("upload_status") == "verified"
+    ):
+        previous_type = pending.get("backup_type")
+        previous_date = pending["scheduled_date"]
+
+        if previous_type not in ("weekly", "monthly"):
+            raise RuntimeError(
+                "Unfinished backup has invalid backup_type; "
+                "refusing to create another backup"
+            )
+
+        logger.info(
+            "Resuming unfinished %s backup scheduled for %s",
+            previous_type.upper(),
+            previous_date,
+        )
+
+        await run_scheduled_backup(
+            session, config, previous_date, previous_type
+        )
         return
 
     timezone_name = policy["timezone"]
@@ -1046,9 +1079,10 @@ async def run_recurring_backup_if_due(session, config, policy):
         return
 
     scheduled_date = local_now.date().isoformat()
+    # The first verified FULL is mandatory for every client.
     backup_type = (
         "monthly"
-        if local_now.day <= 7
+        if policy["initial_full_required"] or local_now.day <= 7
         else "weekly"
     )
 
