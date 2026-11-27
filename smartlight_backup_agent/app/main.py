@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
+from urllib.parse import urlsplit
 import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -16,11 +18,12 @@ from securetar import SecureTarArchive
 OPTIONS_PATH = Path("/data/options.json")
 BACKUP_PASSWORD_PATH = Path("/data/backup_password")
 LEGACY_PASSWORD_PATH = Path("/data/supervisor_test_password")
+PASSWORD_CLIENT_PATH = Path("/data/backup_password_client_code")
 SCHEDULE_STATE_PATH = Path("/data/backup_schedule_state.json")
 
 SUPERVISOR_URL = "http://supervisor"
 DEFAULT_SERVER_URL = "https://backup.smartlight.lt"
-AGENT_VERSION = "1.0.1"
+AGENT_VERSION = "1.0.2"
 
 HEARTBEAT_INTERVAL = 60
 POLICY_SYNC_INTERVAL = 300
@@ -129,6 +132,68 @@ def get_backup_password():
         raise RuntimeError("Backup password file is empty")
 
     return password
+
+
+def write_private_file(path, value):
+    # Do not expose secrets through permissions or partially written files.
+    fd, tmp = tempfile.mkstemp(prefix=".credential-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(value)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_local_password():
+    if BACKUP_PASSWORD_PATH.is_file() or LEGACY_PASSWORD_PATH.is_file():
+        return get_backup_password()
+    return None
+
+
+async def provision_backup_credentials(session, config):
+    url = urlsplit(config["server_url"])
+    if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise RuntimeError("Backup credential provisioning requires an HTTPS NAS URL")
+    code = config["client_code"]
+    if PASSWORD_CLIENT_PATH.exists():
+        if PASSWORD_CLIENT_PATH.read_text(encoding="utf-8").strip() != code:
+            raise RuntimeError("Local backup credential belongs to another client; recovery review required")
+
+    local_password = read_local_password()
+    # Pending local archive data must never be assigned a new password.
+    pending = load_state(SCHEDULE_STATE_PATH)
+    if local_password is None and pending.get("slug"):
+        raise RuntimeError("Pending backup has no local encryption password; recovery review required")
+
+    # Dedicated request: do not use nas_request, whose diagnostic messages
+    # may contain the response body. Never send credentials across redirects.
+    async with session.post(
+        config["server_url"] + "/api/agent/backup-credentials",
+        headers={"X-Client-Key": config["api_key"]},
+        json={"client_code": code, "local_password": local_password},
+        allow_redirects=False,
+    ) as response:
+        if response.status != 200:
+            if response.status == 409:
+                raise RuntimeError("Backup credential conflict; recovery review required")
+            raise RuntimeError(f"NAS backup credential provisioning failed (HTTP {response.status})")
+        try:
+            data = await response.json()
+            password = data["backup_password"]
+            if data["client_code"] != code or not isinstance(password, str) or not password or password.strip() != password:
+                raise ValueError()
+        except Exception:
+            raise RuntimeError("Invalid NAS backup credential response") from None
+    if local_password is not None and password != local_password:
+        raise RuntimeError("NAS backup password differs from local password; refusing to overwrite")
+    # Bind future client reconfiguration to the existing credential.
+    write_private_file(PASSWORD_CLIENT_PATH, code)
+    write_private_file(BACKUP_PASSWORD_PATH, password)
+    logger.info("Backup encryption credential synchronized with NAS Vault")
 
 
 def calculate_file_sha256(path):
@@ -1168,6 +1233,7 @@ async def main():
 
         last_policy_sync = 0
         active_policy = None
+        credentials_ready = False
 
         try:
             while True:
@@ -1192,6 +1258,10 @@ async def main():
                             if active_policy is None:
                                 raise
 
+                    if not credentials_ready:
+                        await provision_backup_credentials(session, config)
+                        credentials_ready = True
+
                     if active_policy is not None:
                         await run_recurring_backup_if_due(
                             session,
@@ -1215,3 +1285,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
