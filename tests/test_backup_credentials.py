@@ -50,7 +50,7 @@ async def test():
         ha.PASSWORD_CLIENT_PATH=root/"backup_password_client_code"
         ha.SCHEDULE_STATE_PATH=root/"backup_schedule_state.json"
         config={"client_code":"SL-A","api_key":"synthetic","server_url":"https://backup.example"}
-        # Briedziai 1: original pending monthly, no password/slug.
+        # New client: original pending monthly, no password/slug.
         ha.save_state({"scheduled_date":"2026-11-27","backup_type":"monthly"},ha.SCHEDULE_STATE_PATH)
         state_before=ha.SCHEDULE_STATE_PATH.read_bytes()
         sess=Session("generated-secret")
@@ -72,11 +72,11 @@ async def test():
         check("Pending state still untouched",ha.SCHEDULE_STATE_PATH.read_bytes()==state_before)
         ha.BACKUP_PASSWORD_PATH.unlink()
         ha.PASSWORD_CLIENT_PATH.unlink()
-        ha.LEGACY_PASSWORD_PATH.write_text("original-Test-HA")
-        sess=Session("original-Test-HA")
+        ha.LEGACY_PASSWORD_PATH.write_text("original-legacy-test")
+        sess=Session("original-legacy-test")
         await ha.provision_backup_credentials(sess,config)
-        check("Legacy password adopted exactly",sess.calls[0][1]["json"]["local_password"]=="original-Test-HA")
-        check("Legacy password remains usable",ha.get_backup_password()=="original-Test-HA")
+        check("Legacy password adopted exactly",sess.calls[0][1]["json"]["local_password"]=="original-legacy-test")
+        check("Legacy password remains usable",ha.get_backup_password()=="original-legacy-test")
         ha.BACKUP_PASSWORD_PATH.unlink()
         ha.save_state({"scheduled_date":"2026-11-22","backup_type":"monthly","slug":"old-archive"},ha.SCHEDULE_STATE_PATH)
         check("Existing local archive without password fails closed",await fails(ha.provision_backup_credentials(sess,config)))
